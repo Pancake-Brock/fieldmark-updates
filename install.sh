@@ -96,9 +96,16 @@ echo ".env written."
 echo
 
 echo "Pulling images (this can take a few minutes on first run)..."
-docker compose -f docker-compose.prod.yml pull
+if ! docker compose -f docker-compose.prod.yml pull; then
+  echo "Failed to pull images — check your internet connection and try again." >&2
+  exit 1
+fi
 echo "Starting Fieldmark..."
-docker compose -f docker-compose.prod.yml up -d
+if ! docker compose -f docker-compose.prod.yml up -d; then
+  echo "Failed to start Fieldmark — a common cause is something else already using port 80" >&2
+  echo "or 443 on this machine. Check what's listening with: sudo ss -tlnp | grep -E ':80|:443'" >&2
+  exit 1
+fi
 
 echo
 printf "Waiting for Fieldmark to start"
@@ -126,18 +133,47 @@ echo "  1) Start blank — create the first admin account"
 echo "  2) Load sample data — explore Fieldmark with example projects first"
 read -rp "Choose 1 or 2: " DATA_CHOICE < /dev/tty
 
+ACCOUNT_OK="1"
 if [ "$DATA_CHOICE" = "2" ]; then
-  docker compose -f docker-compose.prod.yml exec -T api pnpm seed-example-data
+  if ! docker compose -f docker-compose.prod.yml exec -T api pnpm seed-example-data; then
+    ACCOUNT_OK=""
+  fi
 else
   read -rp "Admin name: " ADMIN_NAME < /dev/tty
   read -rp "Admin email: " ADMIN_EMAIL < /dev/tty
   read -rsp "Admin password (min 8 chars): " ADMIN_PASSWORD < /dev/tty
   echo
-  docker compose -f docker-compose.prod.yml exec -T \
+  if ! docker compose -f docker-compose.prod.yml exec -T \
     -e BOOTSTRAP_ADMIN_NAME="$ADMIN_NAME" \
     -e BOOTSTRAP_ADMIN_EMAIL="$ADMIN_EMAIL" \
     -e BOOTSTRAP_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
-    api pnpm bootstrap-admin
+    api pnpm bootstrap-admin; then
+    ACCOUNT_OK=""
+  fi
+fi
+if [ -z "$ACCOUNT_OK" ]; then
+  echo
+  echo "Warning: account setup failed (see the error above) — Fieldmark may still be running," >&2
+  echo "but you'll need to create a login by hand:" >&2
+  echo "  docker compose -f docker-compose.prod.yml exec api pnpm bootstrap-admin" >&2
+fi
+
+# Checks the real published port, not just the api container's own internal health — the
+# previous version of this script skipped this and would print "ready" even when Caddy failed
+# to bind port 80/443 (e.g. because something else, like a leftover previous instance, was
+# already using it), leaving the admin with a URL that just hangs forever.
+echo
+echo "Verifying Fieldmark is reachable..."
+if [ "$MODE_CHOICE" = "2" ]; then
+  CHECK_STATUS="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $DOMAIN" http://127.0.0.1/api/branding || echo 000)"
+else
+  CHECK_STATUS="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1/api/branding || echo 000)"
+fi
+if [ "$CHECK_STATUS" != "200" ]; then
+  echo "Fieldmark did not respond on port 80/443 (got HTTP $CHECK_STATUS instead of 200)." >&2
+  echo "This usually means something else is already using that port. Check with:" >&2
+  echo "  docker compose -f docker-compose.prod.yml logs caddy" >&2
+  exit 1
 fi
 
 echo

@@ -107,10 +107,21 @@ Set-Content -Path ".env" -Value $envLines -Encoding utf8
 Write-Host ".env written."
 Write-Host ""
 
+# $ErrorActionPreference = "Stop" only catches terminating PowerShell errors, NOT a native exe's
+# nonzero exit code — docker compose failing here would otherwise go unnoticed and the script
+# would carry on as if it had succeeded, exactly as it once did.
 Write-Host "Pulling images (this can take a few minutes on first run)..."
 docker compose -f docker-compose.prod.yml pull
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Failed to pull images - check your internet connection and try again."
+    exit 1
+}
 Write-Host "Starting Fieldmark..."
 docker compose -f docker-compose.prod.yml up -d
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Failed to start Fieldmark - a common cause is something else already using port 80 or 443 on this machine (another instance, IIS, Skype, etc). Check with: Get-NetTCPConnection -LocalPort 80,443"
+    exit 1
+}
 
 Write-Host ""
 Write-Host -NoNewline "Waiting for Fieldmark to start"
@@ -152,6 +163,32 @@ if ($dataChoice -eq "2") {
         -e "BOOTSTRAP_ADMIN_EMAIL=$adminEmail" `
         -e "BOOTSTRAP_ADMIN_PASSWORD=$adminPassword" `
         api pnpm bootstrap-admin
+}
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Warning "Account setup failed (see the error above) - Fieldmark may still be running, but you'll need to create a login by hand: docker compose -f docker-compose.prod.yml exec api pnpm bootstrap-admin"
+}
+
+# Checks the real published port, not just the api container's own internal health - the
+# previous version of this script skipped this and would print "ready" even when Caddy failed
+# to bind port 80/443 (e.g. because something else, like a leftover previous instance, was
+# already using it), leaving the admin with a URL that just hangs forever.
+Write-Host ""
+Write-Host "Verifying Fieldmark is reachable..."
+$checkHeaders = @{}
+if ($modeChoice -eq "2") {
+    $checkHeaders["Host"] = $domain
+}
+$reachable = $false
+try {
+    $response = Invoke-WebRequest -Uri "http://127.0.0.1/api/branding" -Headers $checkHeaders -UseBasicParsing -TimeoutSec 10
+    if ($response.StatusCode -eq 200) {
+        $reachable = $true
+    }
+} catch {}
+if (-not $reachable) {
+    Write-Error "Fieldmark did not respond on port 80/443. This usually means something else is already using that port. Check with: docker compose -f docker-compose.prod.yml logs caddy"
+    exit 1
 }
 
 Write-Host ""
