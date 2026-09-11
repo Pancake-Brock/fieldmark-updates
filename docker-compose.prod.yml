@@ -1,0 +1,100 @@
+# For a deployed machine: pulls prebuilt images from GHCR instead of building from source, so
+# nothing beyond Docker itself is needed on the host — no git clone, Node, or pnpm. Local dev
+# keeps using docker-compose.yml (which builds from source) unchanged.
+#
+# Usage: docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d
+#
+# `name:` is pinned rather than left to Compose's directory-basename default — the updater
+# service below runs this same file from inside its own container at a bind-mount path
+# (/deploy), which would otherwise resolve to a different project name than the host's own
+# invocation and silently manage a whole separate, empty stack instead of the real one
+# (caught in testing: it really did this once, spinning up fresh containers and fresh empty
+# volumes under a "deploy" project alongside the untouched real one).
+name: fieldmark
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fieldmark
+      POSTGRES_PASSWORD: fieldmark_dev
+      POSTGRES_DB: fieldmark
+    volumes:
+      - fieldmark_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fieldmark"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # NOTE: self-update only works while FIELDMARK_VERSION is "latest" (the default) — the updater
+  # just runs `docker compose pull`, which is a no-op against a pinned specific-version tag since
+  # that tag's digest never changes. Pinning a version (for stability or as a rollback) is
+  # exactly what disables one-click updates until it's unpinned again.
+  api:
+    image: ghcr.io/pancake-brock/fieldmark-api:${FIELDMARK_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://fieldmark:fieldmark_dev@db:5432/fieldmark?schema=public
+      PORT: 3001
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      TRUST_PROXY: "true"
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost}
+      SESSION_COOKIE_NAME: fieldmark_session
+      UPLOADS_DIR: /data/uploads
+      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:-}
+      # Public manifest published by .github/workflows/release.yml — no credentials needed to
+      # read it, since fieldmark-updates is a public repo even though this source repo isn't.
+      UPDATE_MANIFEST_URL: ${UPDATE_MANIFEST_URL:-https://raw.githubusercontent.com/Pancake-Brock/fieldmark-updates/main/latest.json}
+      UPDATER_URL: http://updater:8080
+      UPDATER_TOKEN: ${WATCHTOWER_HTTP_TOKEN:-}
+      # Same value used above to pick the image tag — passed through so the app itself can tell
+      # whether it's pinned (see env.ts's FIELDMARK_VERSION).
+      FIELDMARK_VERSION: ${FIELDMARK_VERSION:-latest}
+    volumes:
+      - fieldmark_uploads_data:/data/uploads
+
+  caddy:
+    image: ghcr.io/pancake-brock/fieldmark-web:${FIELDMARK_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    volumes:
+      - fieldmark_caddy_data:/data
+      - fieldmark_caddy_config:/config
+
+  # Admin > Updates' "Update Now" button POSTs to the api container, which triggers this — never
+  # reachable directly (no published port). A small owned service (docker/updater-trigger.js),
+  # not a third-party tool: pg_dumps the database (a hard gate — the update is aborted if this
+  # fails, not best-effort) then runs the exact `docker compose pull && up -d` a human would type
+  # by hand, against the real compose file bind-mounted read-only from the host below.
+  updater:
+    image: ghcr.io/pancake-brock/fieldmark-updater:${FIELDMARK_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      UPDATER_TOKEN: ${WATCHTOWER_HTTP_TOKEN:-}
+      # No ?schema=... suffix (unlike api's own DATABASE_URL) — pg_dump's URI parser rejects
+      # unrecognized query params.
+      DATABASE_URL: postgresql://fieldmark:fieldmark_dev@db:5432/fieldmark
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/deploy:ro
+      - fieldmark_backups:/backups
+
+volumes:
+  fieldmark_db_data:
+  fieldmark_uploads_data:
+  fieldmark_caddy_data:
+  fieldmark_caddy_config:
+  fieldmark_backups:
